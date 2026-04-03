@@ -9,10 +9,4 @@ the Web Serial API and remains useful for platforms (such as Android) which
 support the WebUSB API but do not support the Web Serial API.
 
 This is also available as an npm package
-[here](https://www.npmjs.com/package/web-serial-polyfill) for convenience.
-
-A demo of this library is provided as part of the
-[serial terminal demo](https://github.com/GoogleChromeLabs/serial-terminal)
-and can be activated by clicking the
-"[Switch to API polyfill](https://googlechromelabs.github.io/serial-terminal/?polyfill)"
-link.
+[here](https://www.npmjs.com/package/@cmuav/web-serial-polyfill) for convenience.
