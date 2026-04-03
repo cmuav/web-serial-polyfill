@@ -1,5 +1,6 @@
 /*
  * Copyright 2019 Google LLC
+ * Copyright 2026 cmuav
  *
  * Licensed under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in
@@ -17,8 +18,11 @@
  */
 'use strict';
 
+// ── Public types ─────────────────────────────────────────────────────────────
+
 export enum SerialPolyfillProtocol {
-  UsbCdcAcm, // eslint-disable-line no-unused-vars
+  UsbCdcAcm,
+  UsbPl2303,
 }
 
 export interface SerialPolyfillOptions {
@@ -26,6 +30,8 @@ export interface SerialPolyfillOptions {
   usbControlInterfaceClass?: number;
   usbTransferInterfaceClass?: number;
 }
+
+// ── Shared constants ─────────────────────────────────────────────────────────
 
 const kSetLineCoding = 0x20;
 const kSetControlLineState = 0x22;
@@ -40,8 +46,7 @@ const kAcceptableDataBits = [16, 8, 7, 6, 5];
 const kAcceptableStopBits = [1, 2];
 const kAcceptableParity = ['none', 'even', 'odd'];
 
-const kParityIndexMapping: ParityType[] =
-    ['none', 'odd', 'even'];
+const kParityIndexMapping: ParityType[] = ['none', 'odd', 'even'];
 const kStopBitsIndexMapping = [1, 1.5, 2];
 
 const kDefaultPolyfillOptions = {
@@ -50,14 +55,26 @@ const kDefaultPolyfillOptions = {
   usbTransferInterfaceClass: 10,
 };
 
-/**
- * Utility function to get the interface implementing a desired class.
- * @param {USBDevice} device The USB device.
- * @param {number} classCode The desired interface class.
- * @return {USBInterface} The first interface found that implements the desired
- * class.
- * @throws TypeError if no interface is found.
- */
+// ── PL2303 constants (from Linux kernel drivers/usb/serial/pl2303.c) ─────────
+
+const PL2303_VENDOR_ID = 0x067b;
+const PL2303_PRODUCT_IDS: Set<number> = new Set([
+  0x2303, 0x2304, 0x04bb, 0x1234, 0xaaa0, 0xaaa2, 0xaaa8,
+  0x0611, 0x0612, 0x0609, 0x331a, 0x0307, 0xe1f1,
+  // G-series (HXN)
+  0x23a3, 0x23b3, 0x23c3, 0x23d3, 0x23e3, 0x23f3,
+]);
+const PL2303_HXN_PRODUCT_IDS: Set<number> = new Set([
+  0x23a3, 0x23b3, 0x23c3, 0x23d3, 0x23e3, 0x23f3,
+]);
+const PL2303_VENDOR_WRITE_REQUEST = 0x01;
+const PL2303_VENDOR_WRITE_NREQUEST = 0x80;
+const PL2303_VENDOR_WRITE_REQUEST_TYPE = 0x40;
+const PL2303_VENDOR_READ_REQUEST = 0x01;
+const PL2303_VENDOR_READ_REQUEST_TYPE = 0xc0;
+
+// ── Shared helpers ───────────────────────────────────────────────────────────
+
 function findInterface(device: USBDevice, classCode: number): USBInterface {
   const configuration = device.configurations[0];
   for (const iface of configuration.interfaces) {
@@ -69,15 +86,8 @@ function findInterface(device: USBDevice, classCode: number): USBInterface {
   throw new TypeError(`Unable to find interface with class ${classCode}.`);
 }
 
-/**
- * Utility function to get an endpoint with a particular direction.
- * @param {USBInterface} iface The interface to search.
- * @param {USBDirection} direction The desired transfer direction.
- * @return {USBEndpoint} The first endpoint with the desired transfer direction.
- * @throws TypeError if no endpoint is found.
- */
-function findEndpoint(iface: USBInterface, direction: USBDirection):
-    USBEndpoint {
+function findEndpoint(
+    iface: USBInterface, direction: USBDirection): USBEndpoint {
   const alternate = iface.alternates[0];
   for (const endpoint of alternate.endpoints) {
     if (endpoint.direction == direction) {
@@ -88,27 +98,27 @@ function findEndpoint(iface: USBInterface, direction: USBDirection):
                       `${direction} endpoint.`);
 }
 
-/**
- * Implementation of the underlying source API[1] which reads data from a USB
- * endpoint. This can be used to construct a ReadableStream.
- *
- * [1]: https://streams.spec.whatwg.org/#underlying-source-api
- */
+function findBulkInterface(device: USBDevice): USBInterface | null {
+  const config = device.configurations[0];
+  for (const iface of config.interfaces) {
+    const alt = iface.alternates[0];
+    const hasIn = alt.endpoints.some(
+        (e) => e.direction === 'in' && e.type === 'bulk');
+    const hasOut = alt.endpoints.some(
+        (e) => e.direction === 'out' && e.type === 'bulk');
+    if (hasIn && hasOut) return iface;
+  }
+  return null;
+}
+
+// ── Stream helpers ───────────────────────────────────────────────────────────
+
 class UsbEndpointUnderlyingSource implements UnderlyingByteSource {
   private device_: USBDevice;
   private endpoint_: USBEndpoint;
   private onError_: () => void;
-
   type: 'bytes';
 
-  /**
-   * Constructs a new UnderlyingSource that will pull data from the specified
-   * endpoint on the given USB device.
-   *
-   * @param {USBDevice} device
-   * @param {USBEndpoint} endpoint
-   * @param {function} onError function to be called on error
-   */
   constructor(device: USBDevice, endpoint: USBEndpoint, onError: () => void) {
     this.type = 'bytes';
     this.device_ = device;
@@ -116,11 +126,6 @@ class UsbEndpointUnderlyingSource implements UnderlyingByteSource {
     this.onError_ = onError;
   }
 
-  /**
-   * Reads a chunk of data from the device.
-   *
-   * @param {ReadableByteStreamController} controller
-   */
   pull(controller: ReadableByteStreamController): void {
     (async (): Promise<void> => {
       let chunkSize;
@@ -130,7 +135,6 @@ class UsbEndpointUnderlyingSource implements UnderlyingByteSource {
       } else {
         chunkSize = this.endpoint_.packetSize;
       }
-
       try {
         const result = await this.device_.transferIn(
             this.endpoint_.endpointNumber, chunkSize);
@@ -145,62 +149,45 @@ class UsbEndpointUnderlyingSource implements UnderlyingByteSource {
           controller.enqueue(chunk);
         }
       } catch (error) {
-        controller.error(error.toString());
+        controller.error((error as Error).toString());
         this.onError_();
       }
     })();
   }
 }
 
-/**
- * Implementation of the underlying sink API[2] which writes data to a USB
- * endpoint. This can be used to construct a WritableStream.
- *
- * [2]: https://streams.spec.whatwg.org/#underlying-sink-api
- */
 class UsbEndpointUnderlyingSink implements UnderlyingSink<Uint8Array> {
   private device_: USBDevice;
   private endpoint_: USBEndpoint;
   private onError_: () => void;
 
-  /**
-   * Constructs a new UnderlyingSink that will write data to the specified
-   * endpoint on the given USB device.
-   *
-   * @param {USBDevice} device
-   * @param {USBEndpoint} endpoint
-   * @param {function} onError function to be called on error
-   */
   constructor(device: USBDevice, endpoint: USBEndpoint, onError: () => void) {
     this.device_ = device;
     this.endpoint_ = endpoint;
     this.onError_ = onError;
   }
 
-  /**
-   * Writes a chunk to the device.
-   *
-   * @param {Uint8Array} chunk
-   * @param {WritableStreamDefaultController} controller
-   */
   async write(
       chunk: Uint8Array,
       controller: WritableStreamDefaultController): Promise<void> {
     try {
       const result =
-          await this.device_.transferOut(this.endpoint_.endpointNumber, chunk);
+          await this.device_.transferOut(
+              this.endpoint_.endpointNumber, chunk as unknown as BufferSource);
       if (result.status != 'ok') {
         controller.error(result.status);
         this.onError_();
       }
     } catch (error) {
-      controller.error(error.toString());
+      controller.error((error as Error).toString());
       this.onError_();
     }
   }
 }
 
-/** a class used to control serial devices over WebUSB */
+// ── CDC-ACM SerialPort ───────────────────────────────────────────────────────
+
+/** SerialPort for USB CDC-ACM devices (the original polyfill). */
 export class SerialPort {
   private polyfillOptions_: SerialPolyfillOptions;
   private device_: USBDevice;
@@ -209,27 +196,19 @@ export class SerialPort {
   private inEndpoint_: USBEndpoint;
   private outEndpoint_: USBEndpoint;
 
-  private serialOptions_: SerialOptions;
-  private readable_: ReadableStream<Uint8Array> | null;
-  private writable_: WritableStream<Uint8Array> | null;
+  private serialOptions_!: SerialOptions;
+  private readable_: ReadableStream<Uint8Array> | null = null;
+  private writable_: WritableStream<Uint8Array> | null = null;
   private outputSignals_: SerialOutputSignals;
 
-  /**
-   * constructor taking a WebUSB device that creates a SerialPort instance.
-   * @param {USBDevice} device A device acquired from the WebUSB API
-   * @param {SerialPolyfillOptions} polyfillOptions Optional options to
-   * configure the polyfill.
-   */
   public constructor(
-      device: USBDevice,
-      polyfillOptions?: SerialPolyfillOptions) {
+      device: USBDevice, polyfillOptions?: SerialPolyfillOptions) {
     this.polyfillOptions_ = {...kDefaultPolyfillOptions, ...polyfillOptions};
     this.outputSignals_ = {
       dataTerminalReady: false,
       requestToSend: false,
       break: false,
     };
-
     this.device_ = device;
     this.controlInterface_ = findInterface(
         this.device_,
@@ -241,11 +220,6 @@ export class SerialPort {
     this.outEndpoint_ = findEndpoint(this.transferInterface_, 'out');
   }
 
-  /**
-   * Getter for the readable attribute. Constructs a new ReadableStream as
-   * necessary.
-   * @return {ReadableStream} the current readable stream
-   */
   public get readable(): ReadableStream<Uint8Array> | null {
     if (!this.readable_ && this.device_.opened) {
       this.readable_ = new ReadableStream<Uint8Array>(
@@ -253,18 +227,11 @@ export class SerialPort {
               this.device_, this.inEndpoint_, () => {
                 this.readable_ = null;
               }),
-          {
-            highWaterMark: this.serialOptions_.bufferSize ?? kDefaultBufferSize,
-          });
+          {highWaterMark: this.serialOptions_.bufferSize ?? kDefaultBufferSize});
     }
     return this.readable_;
   }
 
-  /**
-   * Getter for the writable attribute. Constructs a new WritableStream as
-   * necessary.
-   * @return {WritableStream} the current writable stream
-   */
   public get writable(): WritableStream<Uint8Array> | null {
     if (!this.writable_ && this.device_.opened) {
       this.writable_ = new WritableStream(
@@ -279,53 +246,35 @@ export class SerialPort {
     return this.writable_;
   }
 
-  /**
-   * a function that opens the device and claims all interfaces needed to
-   * control and communicate to and from the serial device
-   * @param {SerialOptions} options Object containing serial options
-   * @return {Promise<void>} A promise that will resolve when device is ready
-   * for communication
-   */
   public async open(options: SerialOptions): Promise<void> {
     this.serialOptions_ = options;
     this.validateOptions();
-
     try {
       await this.device_.open();
       if (this.device_.configuration === null) {
         await this.device_.selectConfiguration(1);
       }
+      try { await this.device_.reset(); } catch { /* ok */ }
+      if (!this.device_.opened) await this.device_.open();
 
-      await this.device_.claimInterface(this.controlInterface_.interfaceNumber);
+      await this.device_.claimInterface(
+          this.controlInterface_.interfaceNumber);
       if (this.controlInterface_ !== this.transferInterface_) {
         await this.device_.claimInterface(
             this.transferInterface_.interfaceNumber);
       }
-
       await this.setLineCoding();
       await this.setSignals({dataTerminalReady: true});
     } catch (error) {
-      if (this.device_.opened) {
-        await this.device_.close();
-      }
-      throw new Error('Error setting up device: ' + error.toString());
+      if (this.device_.opened) await this.device_.close();
+      throw new Error('Error setting up device: ' + (error as Error).toString());
     }
   }
 
-  /**
-   * Closes the port.
-   *
-   * @return {Promise<void>} A promise that will resolve when the port is
-   * closed.
-   */
   public async close(): Promise<void> {
-    const promises = [];
-    if (this.readable_) {
-      promises.push(this.readable_.cancel());
-    }
-    if (this.writable_) {
-      promises.push(this.writable_.abort());
-    }
+    const promises: Promise<void>[] = [];
+    if (this.readable_) promises.push(this.readable_.cancel());
+    if (this.writable_) promises.push(this.writable_.abort());
     await Promise.all(promises);
     this.readable_ = null;
     this.writable_ = null;
@@ -335,20 +284,10 @@ export class SerialPort {
     }
   }
 
-  /**
-   * Forgets the port.
-   *
-   * @return {Promise<void>} A promise that will resolve when the port is
-   * forgotten.
-   */
   public async forget(): Promise<void> {
     return this.device_.forget();
   }
 
-  /**
-   * A function that returns properties of the device.
-   * @return {SerialPortInfo} Device properties.
-   */
   public getInfo(): SerialPortInfo {
     return {
       usbVendorId: this.device_.vendorId,
@@ -356,190 +295,304 @@ export class SerialPort {
     };
   }
 
-  /**
-   * A function used to change the serial settings of the device
-   * @param {object} options the object which carries serial settings data
-   * @return {Promise<void>} A promise that will resolve when the options are
-   * set
-   */
   public reconfigure(options: SerialOptions): Promise<void> {
     this.serialOptions_ = {...this.serialOptions_, ...options};
     this.validateOptions();
     return this.setLineCoding();
   }
 
-  /**
-   * Sets control signal state for the port.
-   * @param {SerialOutputSignals} signals The signals to enable or disable.
-   * @return {Promise<void>} a promise that is resolved when the signal state
-   * has been changed.
-   */
   public async setSignals(signals: SerialOutputSignals): Promise<void> {
     this.outputSignals_ = {...this.outputSignals_, ...signals};
-
     if (signals.dataTerminalReady !== undefined ||
         signals.requestToSend !== undefined) {
-      // The Set_Control_Line_State command expects a bitmap containing the
-      // values of all output signals that should be enabled or disabled.
-      //
-      // Ref: USB CDC specification version 1.1 §6.2.14.
       const value = (this.outputSignals_.dataTerminalReady ? 1 << 0 : 0) |
                     (this.outputSignals_.requestToSend ? 1 << 1 : 0);
-
       await this.device_.controlTransferOut({
-        'requestType': 'class',
-        'recipient': 'interface',
-        'request': kSetControlLineState,
-        'value': value,
+        'requestType': 'class', 'recipient': 'interface',
+        'request': kSetControlLineState, 'value': value,
         'index': this.controlInterface_.interfaceNumber,
       });
     }
-
     if (signals.break !== undefined) {
-      // The SendBreak command expects to be given a duration for how long the
-      // break signal should be asserted. Passing 0xFFFF enables the signal
-      // until 0x0000 is send.
-      //
-      // Ref: USB CDC specification version 1.1 §6.2.15.
       const value = this.outputSignals_.break ? 0xFFFF : 0x0000;
-
       await this.device_.controlTransferOut({
-        'requestType': 'class',
-        'recipient': 'interface',
-        'request': kSendBreak,
-        'value': value,
+        'requestType': 'class', 'recipient': 'interface',
+        'request': kSendBreak, 'value': value,
         'index': this.controlInterface_.interfaceNumber,
       });
     }
   }
 
-  /**
-   * Checks the serial options for validity and throws an error if it is
-   * not valid
-   */
   private validateOptions(): void {
-    if (!this.isValidBaudRate(this.serialOptions_.baudRate)) {
+    if (!this.isValidBaudRate(this.serialOptions_.baudRate))
       throw new RangeError('invalid Baud Rate ' + this.serialOptions_.baudRate);
-    }
-
-    if (!this.isValidDataBits(this.serialOptions_.dataBits)) {
+    if (!this.isValidDataBits(this.serialOptions_.dataBits))
       throw new RangeError('invalid dataBits ' + this.serialOptions_.dataBits);
-    }
-
-    if (!this.isValidStopBits(this.serialOptions_.stopBits)) {
+    if (!this.isValidStopBits(this.serialOptions_.stopBits))
       throw new RangeError('invalid stopBits ' + this.serialOptions_.stopBits);
-    }
-
-    if (!this.isValidParity(this.serialOptions_.parity)) {
+    if (!this.isValidParity(this.serialOptions_.parity))
       throw new RangeError('invalid parity ' + this.serialOptions_.parity);
-    }
   }
 
-  /**
-   * Checks the baud rate for validity
-   * @param {number} baudRate the baud rate to check
-   * @return {boolean} A boolean that reflects whether the baud rate is valid
-   */
   private isValidBaudRate(baudRate: number): boolean {
     return baudRate % 1 === 0;
   }
-
-  /**
-   * Checks the data bits for validity
-   * @param {number} dataBits the data bits to check
-   * @return {boolean} A boolean that reflects whether the data bits setting is
-   * valid
-   */
   private isValidDataBits(dataBits: number | undefined): boolean {
-    if (typeof dataBits === 'undefined') {
-      return true;
-    }
-    return kAcceptableDataBits.includes(dataBits);
+    return typeof dataBits === 'undefined' || kAcceptableDataBits.includes(dataBits);
   }
-
-  /**
-   * Checks the stop bits for validity
-   * @param {number} stopBits the stop bits to check
-   * @return {boolean} A boolean that reflects whether the stop bits setting is
-   * valid
-   */
   private isValidStopBits(stopBits: number | undefined): boolean {
-    if (typeof stopBits === 'undefined') {
-      return true;
-    }
-    return kAcceptableStopBits.includes(stopBits);
+    return typeof stopBits === 'undefined' || kAcceptableStopBits.includes(stopBits);
   }
-
-  /**
-   * Checks the parity for validity
-   * @param {string} parity the parity to check
-   * @return {boolean} A boolean that reflects whether the parity is valid
-   */
   private isValidParity(parity: ParityType | undefined): boolean {
-    if (typeof parity === 'undefined') {
-      return true;
-    }
-    return kAcceptableParity.includes(parity);
+    return typeof parity === 'undefined' || kAcceptableParity.includes(parity);
   }
 
-  /**
-   * sends the options alog the control interface to set them on the device
-   * @return {Promise} a promise that will resolve when the options are set
-   */
   private async setLineCoding(): Promise<void> {
-    // Ref: USB CDC specification version 1.1 §6.2.12.
     const buffer = new ArrayBuffer(7);
     const view = new DataView(buffer);
     view.setUint32(0, this.serialOptions_.baudRate, true);
-    view.setUint8(
-        4, kStopBitsIndexMapping.indexOf(
-            this.serialOptions_.stopBits ?? kDefaultStopBits));
-    view.setUint8(
-        5, kParityIndexMapping.indexOf(
-            this.serialOptions_.parity ?? kDefaultParity));
+    view.setUint8(4, kStopBitsIndexMapping.indexOf(
+        this.serialOptions_.stopBits ?? kDefaultStopBits));
+    view.setUint8(5, kParityIndexMapping.indexOf(
+        this.serialOptions_.parity ?? kDefaultParity));
     view.setUint8(6, this.serialOptions_.dataBits ?? kDefaultDataBits);
-
     const result = await this.device_.controlTransferOut({
-      'requestType': 'class',
-      'recipient': 'interface',
-      'request': kSetLineCoding,
-      'value': 0x00,
+      'requestType': 'class', 'recipient': 'interface',
+      'request': kSetLineCoding, 'value': 0x00,
       'index': this.controlInterface_.interfaceNumber,
     }, buffer);
-    if (result.status != 'ok') {
+    if (result.status != 'ok')
       throw new DOMException('NetworkError', 'Failed to set line coding.');
-    }
   }
 }
 
-/** implementation of the global navigator.serial object */
+// ── PL2303 SerialPort ────────────────────────────────────────────────────────
+
+/**
+ * SerialPort for Prolific PL2303 USB-to-serial adapters.
+ *
+ * Implements the PL2303 vendor protocol (including HXN/G-series variants)
+ * directly over WebUSB, bypassing the need for OS kernel drivers.
+ *
+ * Reference: Linux kernel drivers/usb/serial/pl2303.c
+ */
+export class PL2303SerialPort {
+  private device_: USBDevice;
+  private isHXN_: boolean;
+  private inEndpoint_!: USBEndpoint;
+  private outEndpoint_!: USBEndpoint;
+
+  private serialOptions_!: SerialOptions;
+  private readable_: ReadableStream<Uint8Array> | null = null;
+  private writable_: WritableStream<Uint8Array> | null = null;
+
+  public constructor(device: USBDevice) {
+    this.device_ = device;
+    this.isHXN_ = PL2303_HXN_PRODUCT_IDS.has(device.productId);
+  }
+
+  public get readable(): ReadableStream<Uint8Array> | null {
+    if (!this.readable_ && this.device_.opened) {
+      this.readable_ = new ReadableStream<Uint8Array>(
+          new UsbEndpointUnderlyingSource(
+              this.device_, this.inEndpoint_, () => {
+                this.readable_ = null;
+              }),
+          {highWaterMark: this.serialOptions_.bufferSize ?? kDefaultBufferSize});
+    }
+    return this.readable_;
+  }
+
+  public get writable(): WritableStream<Uint8Array> | null {
+    if (!this.writable_ && this.device_.opened) {
+      this.writable_ = new WritableStream(
+          new UsbEndpointUnderlyingSink(
+              this.device_, this.outEndpoint_, () => {
+                this.writable_ = null;
+              }),
+          new ByteLengthQueuingStrategy({
+            highWaterMark: this.serialOptions_.bufferSize ?? kDefaultBufferSize,
+          }));
+    }
+    return this.writable_;
+  }
+
+  public async open(options: SerialOptions): Promise<void> {
+    this.serialOptions_ = options;
+
+    const dev = this.device_;
+    try {
+      await dev.open();
+      if (dev.configuration === null) await dev.selectConfiguration(1);
+
+      // Find bulk data interface
+      const dataIface = findBulkInterface(dev);
+      if (!dataIface)
+        throw new Error('PL2303: No data interface with bulk endpoints found');
+
+      const alt = dataIface.alternates[0];
+      this.inEndpoint_ = alt.endpoints.find(
+          (e) => e.direction === 'in' && e.type === 'bulk')!;
+      this.outEndpoint_ = alt.endpoints.find(
+          (e) => e.direction === 'out' && e.type === 'bulk')!;
+
+      // Claim all interfaces
+      for (const iface of dev.configuration!.interfaces) {
+        await dev.claimInterface(iface.interfaceNumber);
+      }
+
+      // PL2303 init sequence
+      await this.initChip_();
+
+      // Set line coding: baud, 8N1
+      await this.setLineCoding_(options.baudRate,
+          options.dataBits ?? kDefaultDataBits,
+          kStopBitsIndexMapping.indexOf(options.stopBits ?? kDefaultStopBits),
+          kParityIndexMapping.indexOf(options.parity ?? kDefaultParity));
+
+      // Enable DTR + RTS
+      await this.setControlLines_(0x01 | 0x02);
+
+      // HXN post-init
+      if (this.isHXN_) await this.vendorWrite_(7, 0x07);
+    } catch (error) {
+      if (dev.opened) await dev.close();
+      throw new Error(
+          'Error setting up PL2303 device: ' + (error as Error).toString());
+    }
+  }
+
+  public async close(): Promise<void> {
+    const promises: Promise<void>[] = [];
+    if (this.readable_) promises.push(this.readable_.cancel());
+    if (this.writable_) promises.push(this.writable_.abort());
+    await Promise.all(promises);
+    this.readable_ = null;
+    this.writable_ = null;
+    if (this.device_.opened) {
+      try { await this.setControlLines_(0); } catch { /* ok */ }
+      await this.device_.close();
+    }
+  }
+
+  public async forget(): Promise<void> {
+    return this.device_.forget();
+  }
+
+  public getInfo(): SerialPortInfo {
+    return {
+      usbVendorId: this.device_.vendorId,
+      usbProductId: this.device_.productId,
+    };
+  }
+
+  // ── PL2303 init (from kernel pl2303_startup) ──────────────────────────────
+
+  private async initChip_(): Promise<void> {
+    if (this.isHXN_) return; // G-series needs no init sequence
+
+    // Classic PL2303/HX init handshake
+    const buf = new Uint8Array(1);
+    await this.vendorRead_(0x8484, buf);
+    await this.vendorWrite_(0x0404, 0);
+    await this.vendorRead_(0x8484, buf);
+    await this.vendorRead_(0x8383, buf);
+    await this.vendorRead_(0x8484, buf);
+    await this.vendorWrite_(0x0404, 1);
+    await this.vendorRead_(0x8484, buf);
+    await this.vendorRead_(0x8383, buf);
+    await this.vendorWrite_(0, 1);
+    await this.vendorWrite_(1, 0);
+    await this.vendorWrite_(2, 0x44);
+  }
+
+  private async vendorWrite_(value: number, index: number): Promise<void> {
+    const request = this.isHXN_ ?
+        PL2303_VENDOR_WRITE_NREQUEST : PL2303_VENDOR_WRITE_REQUEST;
+    await this.device_.controlTransferOut({
+      requestType: 'vendor', recipient: 'device',
+      request, value, index,
+    });
+  }
+
+  private async vendorRead_(value: number, buf: Uint8Array): Promise<void> {
+    const request = this.isHXN_ ?
+        PL2303_VENDOR_WRITE_NREQUEST : PL2303_VENDOR_READ_REQUEST;
+    const result = await this.device_.controlTransferIn({
+      requestType: 'vendor', recipient: 'device',
+      request, value, index: 0,
+    }, buf.length);
+    if (result.data) {
+      const src = new Uint8Array(
+          result.data.buffer, result.data.byteOffset, result.data.byteLength);
+      buf.set(src.subarray(0, buf.length));
+    }
+  }
+
+  private async setLineCoding_(
+      baudRate: number, dataBits: number,
+      stopBits: number, parity: number): Promise<void> {
+    const buffer = new ArrayBuffer(7);
+    const view = new DataView(buffer);
+    view.setUint32(0, baudRate, true);
+    view.setUint8(4, stopBits);
+    view.setUint8(5, parity);
+    view.setUint8(6, dataBits);
+    await this.device_.controlTransferOut({
+      requestType: 'class', recipient: 'interface',
+      request: kSetLineCoding, value: 0, index: 0,
+    }, buffer);
+  }
+
+  private async setControlLines_(value: number): Promise<void> {
+    await this.device_.controlTransferOut({
+      requestType: 'class', recipient: 'interface',
+      request: kSetControlLineState, value, index: 0,
+    });
+  }
+}
+
+// ── Detect protocol from device ──────────────────────────────────────────────
+
+function isPL2303(device: USBDevice): boolean {
+  return device.vendorId === PL2303_VENDOR_ID &&
+      PL2303_PRODUCT_IDS.has(device.productId);
+}
+
+function createPort(
+    device: USBDevice,
+    polyfillOptions: SerialPolyfillOptions): SerialPort | PL2303SerialPort {
+  if (isPL2303(device)) return new PL2303SerialPort(device);
+  return new SerialPort(device, polyfillOptions);
+}
+
+// ── Serial (navigator.serial replacement) ────────────────────────────────────
+
 class Serial {
-  /**
-   * Requests permission to access a new port.
-   *
-   * @param {SerialPortRequestOptions} options
-   * @param {SerialPolyfillOptions} polyfillOptions
-   * @return {Promise<SerialPort>}
-   */
   async requestPort(
       options?: SerialPortRequestOptions,
-      polyfillOptions?: SerialPolyfillOptions): Promise<SerialPort> {
+      polyfillOptions?: SerialPolyfillOptions,
+  ): Promise<SerialPort | PL2303SerialPort> {
     polyfillOptions = {...kDefaultPolyfillOptions, ...polyfillOptions};
 
     const usbFilters: USBDeviceFilter[] = [];
+
     if (options && options.filters) {
       for (const filter of options.filters) {
         const usbFilter: USBDeviceFilter = {
           classCode: polyfillOptions.usbControlInterfaceClass,
         };
-        if (filter.usbVendorId !== undefined) {
+        if (filter.usbVendorId !== undefined)
           usbFilter.vendorId = filter.usbVendorId;
-        }
-        if (filter.usbProductId !== undefined) {
+        if (filter.usbProductId !== undefined)
           usbFilter.productId = filter.usbProductId;
-        }
         usbFilters.push(usbFilter);
       }
+    }
+
+    // Always include PL2303 filters so they show up in the picker
+    for (const pid of PL2303_PRODUCT_IDS) {
+      usbFilters.push({vendorId: PL2303_VENDOR_ID, productId: pid});
     }
 
     if (usbFilters.length === 0) {
@@ -548,36 +601,24 @@ class Serial {
       });
     }
 
-    const device = await navigator.usb.requestDevice({'filters': usbFilters});
-    const port = new SerialPort(device, polyfillOptions);
-    return port;
+    const device = await navigator.usb.requestDevice({filters: usbFilters});
+    return createPort(device, polyfillOptions);
   }
 
-  /**
-   * Get the set of currently available ports.
-   *
-   * @param {SerialPolyfillOptions} polyfillOptions Polyfill configuration that
-   * should be applied to these ports.
-   * @return {Promise<SerialPort[]>} a promise that is resolved with a list of
-   * ports.
-   */
   async getPorts(polyfillOptions?: SerialPolyfillOptions):
-      Promise<SerialPort[]> {
+      Promise<Array<SerialPort | PL2303SerialPort>> {
     polyfillOptions = {...kDefaultPolyfillOptions, ...polyfillOptions};
-
     const devices = await navigator.usb.getDevices();
-    const ports: SerialPort[] = [];
-    devices.forEach((device) => {
+    const ports: Array<SerialPort | PL2303SerialPort> = [];
+    for (const device of devices) {
       try {
-        const port = new SerialPort(device, polyfillOptions);
-        ports.push(port);
-      } catch (e) {
-        // Skip unrecognized port.
+        ports.push(createPort(device, polyfillOptions));
+      } catch {
+        // Skip unrecognized device
       }
-    });
+    }
     return ports;
   }
 }
 
-/* an object to be used for starting the serial workflow */
 export const serial = new Serial();

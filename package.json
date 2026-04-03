@@ -1,29 +1,50 @@
 {
-  "name": "web-serial-polyfill",
-  "version": "1.0.15",
-  "description": "An implementation of the [Serial API](https://wicg.github.io/serial) on top of the [WebUSB API](https://wicg.github.io/webusb) for use with USB-to-serial adapters. Use of this library is limited to hardware and platforms where the device is accessible via the WebUSB API because it has not been claimed by a built-in device driver. This project will be used to prototype the design of the Serial API.",
+  "name": "@cmuav/web-serial-polyfill",
+  "version": "1.1.0",
+  "description": "WebSerial API polyfill over WebUSB, supporting CDC-ACM and Prolific PL2303 USB-to-serial adapters (including G-series HXN variants). Fork of google/web-serial-polyfill with PL2303 support.",
   "type": "module",
   "main": "./dist/serial.js",
   "types": "./dist/serial.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/serial.js",
+      "types": "./dist/serial.d.ts"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE"],
   "scripts": {
     "lint": "eslint serial.ts",
     "build": "tsc -d",
-    "prepublish": "tsc -d"
+    "prepublishOnly": "tsc -d"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/google/web-serial-polyfill.git"
+    "url": "git+https://github.com/cmuav/web-serial-polyfill.git"
+  },
+  "homepage": "https://github.com/cmuav/web-serial-polyfill#readme",
+  "bugs": {
+    "url": "https://github.com/cmuav/web-serial-polyfill/issues"
   },
   "author": "James C Hollyer",
-  "license": "Apache",
+  "contributors": ["cmuav"],
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "webserial",
+    "webusb",
+    "serial",
+    "polyfill",
+    "pl2303",
+    "prolific",
+    "cdc-acm",
+    "usb-serial"
+  ],
   "devDependencies": {
     "@types/w3c-web-serial": "^1.0.3",
     "@types/w3c-web-usb": "^1.0.6",
     "@types/web": "^0.0.71",
-    "@typescript-eslint/eslint-plugin": "^5.33.0",
-    "@typescript-eslint/parser": "^5.33.0",
-    "eslint": "^8.21.0",
-    "eslint-config-google": "^0.14.0",
-    "typescript": "^4.7.4"
+    "typescript": "^5.8.3"
   }
 }
