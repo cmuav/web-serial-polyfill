@@ -569,39 +569,53 @@ function createPort(
 // ── Serial (navigator.serial replacement) ────────────────────────────────────
 
 class Serial {
+  /**
+   * Requests permission to access a port.
+   *
+   * Shows ALL connected USB devices in the picker — no filtering.
+   * PL2303 devices are auto-detected and get the PL2303 driver;
+   * everything else is treated as CDC-ACM.
+   */
   async requestPort(
       options?: SerialPortRequestOptions,
       polyfillOptions?: SerialPolyfillOptions,
   ): Promise<SerialPort | PL2303SerialPort> {
     polyfillOptions = {...kDefaultPolyfillOptions, ...polyfillOptions};
 
+    // Build USB filters from serial filters if provided
     const usbFilters: USBDeviceFilter[] = [];
-
-    if (options && options.filters) {
+    if (options?.filters) {
       for (const filter of options.filters) {
-        const usbFilter: USBDeviceFilter = {
-          classCode: polyfillOptions.usbControlInterfaceClass,
-        };
-        if (filter.usbVendorId !== undefined)
-          usbFilter.vendorId = filter.usbVendorId;
-        if (filter.usbProductId !== undefined)
-          usbFilter.productId = filter.usbProductId;
+        const usbFilter: USBDeviceFilter = {};
+        if (filter.usbVendorId !== undefined) usbFilter.vendorId = filter.usbVendorId;
+        if (filter.usbProductId !== undefined) usbFilter.productId = filter.usbProductId;
         usbFilters.push(usbFilter);
       }
     }
 
-    // Always include PL2303 filters so they show up in the picker
-    for (const pid of PL2303_PRODUCT_IDS) {
-      usbFilters.push({vendorId: PL2303_VENDOR_ID, productId: pid});
-    }
-
+    // Android WebUSB requires at least one filter to show devices in the picker.
+    // Include CDC-ACM class and known PL2303 vendor as defaults so both chip
+    // families appear, then also add an exclusionFilters-free catch-all request
+    // as a fallback for desktop browsers that support empty filters.
     if (usbFilters.length === 0) {
-      usbFilters.push({
-        classCode: polyfillOptions.usbControlInterfaceClass,
-      });
+      usbFilters.push(
+        {classCode: polyfillOptions.usbControlInterfaceClass},  // CDC-ACM
+        {vendorId: PL2303_VENDOR_ID},                           // PL2303
+      );
     }
 
-    const device = await navigator.usb.requestDevice({filters: usbFilters});
+    let device: USBDevice;
+    try {
+      device = await navigator.usb.requestDevice({filters: usbFilters});
+    } catch (e) {
+      // If filtered request fails (e.g. no matching devices), try unfiltered
+      // for browsers that support it (desktop Chrome)
+      if ((e as Error).name === 'NotFoundError') {
+        device = await navigator.usb.requestDevice({filters: []});
+      } else {
+        throw e;
+      }
+    }
     return createPort(device, polyfillOptions);
   }
 
