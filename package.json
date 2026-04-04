@@ -1,6 +1,6 @@
 {
   "name": "@cmuav/web-serial-polyfill",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "WebSerial API polyfill over WebUSB, supporting CDC-ACM and Prolific PL2303 USB-to-serial adapters (including G-series HXN variants). Fork of google/web-serial-polyfill with PL2303 support.",
   "type": "module",
   "main": "./dist/serial.js",

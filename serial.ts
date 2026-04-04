@@ -31,6 +31,11 @@ export interface SerialPolyfillOptions {
   usbTransferInterfaceClass?: number;
 }
 
+export interface SerialOpenOptions extends SerialOptions {
+  /** Send a USB device reset before claiming interfaces. Default: false. */
+  resetUsb?: boolean;
+}
+
 // ── Shared constants ─────────────────────────────────────────────────────────
 
 const kSetLineCoding = 0x20;
@@ -246,7 +251,7 @@ export class SerialPort {
     return this.writable_;
   }
 
-  public async open(options: SerialOptions): Promise<void> {
+  public async open(options: SerialOpenOptions): Promise<void> {
     this.serialOptions_ = options;
     this.validateOptions();
     try {
@@ -254,8 +259,10 @@ export class SerialPort {
       if (this.device_.configuration === null) {
         await this.device_.selectConfiguration(1);
       }
-      try { await this.device_.reset(); } catch { /* ok */ }
-      if (!this.device_.opened) await this.device_.open();
+      if (options.resetUsb) {
+        try { await this.device_.reset(); } catch { /* ok */ }
+        if (!this.device_.opened) await this.device_.open();
+      }
 
       await this.device_.claimInterface(
           this.controlInterface_.interfaceNumber);
@@ -417,13 +424,17 @@ export class PL2303SerialPort {
     return this.writable_;
   }
 
-  public async open(options: SerialOptions): Promise<void> {
+  public async open(options: SerialOpenOptions): Promise<void> {
     this.serialOptions_ = options;
 
     const dev = this.device_;
     try {
       await dev.open();
       if (dev.configuration === null) await dev.selectConfiguration(1);
+      if (options.resetUsb) {
+        try { await dev.reset(); } catch { /* ok */ }
+        if (!dev.opened) await dev.open();
+      }
 
       // Find bulk data interface
       const dataIface = findBulkInterface(dev);
@@ -594,13 +605,21 @@ class Serial {
     }
 
     // Android WebUSB requires at least one filter to show devices in the picker.
-    // Include CDC-ACM class and known PL2303 vendor as defaults so both chip
-    // families appear, then also add an exclusionFilters-free catch-all request
-    // as a fallback for desktop browsers that support empty filters.
+    // Use vendor ID filters for known USB-serial chips since classCode filters
+    // can be unreliable on Android.
     if (usbFilters.length === 0) {
       usbFilters.push(
-        {classCode: polyfillOptions.usbControlInterfaceClass},  // CDC-ACM
-        {vendorId: PL2303_VENDOR_ID},                           // PL2303
+        {vendorId: PL2303_VENDOR_ID},   // Prolific PL2303
+        {vendorId: 0x0403},             // FTDI
+        {vendorId: 0x1a86},             // QinHeng CH340/CH341
+        {vendorId: 0x10c4},             // Silicon Labs CP210x
+        {vendorId: 0x2341},             // Arduino
+        {vendorId: 0x239a},             // Adafruit
+        {vendorId: 0x2e8a},             // Raspberry Pi Pico
+        {vendorId: 0x3483},             // STMicroelectronics
+        {vendorId: 0x26ac},             // CubePilot/ProfiCNC
+        {vendorId: 0x1209},             // Generic USB (pid.codes)
+        {vendorId: 0x27ac},             // CubePilot (alternate)
       );
     }
 
